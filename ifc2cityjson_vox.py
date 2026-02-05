@@ -252,9 +252,15 @@ class GeometryProcessor:
         return v, b
 
 class Georeferencer:
+    # SLD99 / Sri Lanka Grid 1999 (EPSG:5235)
+    # Default origin: central Colombo area
+    DEFAULT_CRS = "https://www.opengis.net/def/crs/EPSG/0/5235"
+    DEFAULT_TRANSLATE = [399800.0, 492200.0, 10.0]  # Easting, Northing, Height in SLD99
+
     def __init__(self, reader):
         self.reader = reader
-        self.translate = [0.0, 0.0, 0.0]
+        self.translate = list(self.DEFAULT_TRANSLATE)
+        self.reference_system = self.DEFAULT_CRS
         self.found_crs = False
 
     def solve(self):
@@ -270,14 +276,19 @@ class Georeferencer:
                         self.found_crs = True
                         return
         if not self.found_crs:
+            # Offset building placement relative to SLD99 default origin
             buildings = self.reader.get_buildings()
             if buildings and buildings[0].ObjectPlacement:
                 try:
                     m = ifcopenshell.util.placement.get_local_placement(buildings[0].ObjectPlacement)
-                    self.translate = [float(m[0][3]), float(m[1][3]), float(m[2][3])]
-                    logger.info(f"Dynamic center calculated: {self.translate}")
+                    self.translate = [
+                        self.DEFAULT_TRANSLATE[0] + float(m[0][3]),
+                        self.DEFAULT_TRANSLATE[1] + float(m[1][3]),
+                        self.DEFAULT_TRANSLATE[2] + float(m[2][3]),
+                    ]
                 except Exception:
                     pass
+            logger.info(f"Using SLD99 (EPSG:5235) georeference: {self.translate}")
 
 class Converter:
     def __init__(self, ifc, out):
@@ -322,7 +333,7 @@ class Converter:
             return indices
 
         def add_object(cj_type, verts, bounds, attrs=None):
-            if not verts: return
+            if not verts: return None
 
             idx_map = add_verts(verts)
             new_bounds = []
@@ -331,23 +342,28 @@ class Converter:
                 for ring in surf:
                     new_surf.append([idx_map[idx] for idx in ring])
                 new_bounds.append(new_surf)
-            
+
+            obj_id = str(uuid4())
             obj = {
                 "type": cj_type,
                 "geometry": [{
                     "type": "MultiSurface",
-                    "lod": "2.2", 
+                    "lod": "2.2",
                     "boundaries": new_bounds
                 }]
             }
             if attrs: obj["attributes"] = attrs
-            city_objects[str(uuid4())] = obj
+            city_objects[obj_id] = obj
+            return obj_id
+
+        child_ids = []
 
         # 1. Process Elements
         logger.info("Processing standard elements...")
         for elem in reader.get_elements():
             v, b = proc.extract(elem)
-            add_object(self.map_type(elem), v, b, {"ifc_type": elem.is_a(), "name": getattr(elem, "Name", "")})
+            oid = add_object(self.map_type(elem), v, b, {"ifc_type": elem.is_a(), "name": getattr(elem, "Name", "")})
+            if oid: child_ids.append(oid)
 
         # 2. Process Spaces (Native)
         spaces = reader.get_spaces()
@@ -355,17 +371,30 @@ class Converter:
             logger.info(f"Processing {len(spaces)} native IFC spaces...")
             for space in spaces:
                 v, b = proc.extract(space)
-                add_object("Room", v, b, {"name": getattr(space, "Name", "Space")})
+                oid = add_object("Room", v, b, {"name": getattr(space, "Name", "Space")})
+                if oid: child_ids.append(oid)
         else:
             # --- MODIFICATION: VOXEL FALLBACK ---
             logger.info("No IfcSpace found. Attempting Voxel Detection...")
             detector = VoxelSpaceDetector(reader, voxel_size=0.5)
             detected_rooms = detector.detect()
             logger.info(f"Voxelization detected {len(detected_rooms)} rooms.")
-            
+
             for i, room in enumerate(detected_rooms):
-                add_object("Room", room["vertices"], room["boundaries"], {"name": f"Detected Room {i+1}"})
+                oid = add_object("Room", room["vertices"], room["boundaries"], {"name": f"Detected Room {i+1}"})
+                if oid: child_ids.append(oid)
             # ------------------------------------
+
+        # 3. Create parent Building and link children
+        building_id = str(uuid4())
+        city_objects[building_id] = {
+            "type": "Building",
+            "attributes": {},
+            "geometry": [],
+            "children": child_ids
+        }
+        for cid in child_ids:
+            city_objects[cid]["parents"] = [building_id]
 
         # Final JSON
         cj = {
@@ -375,7 +404,9 @@ class Converter:
                 "scale": [0.001, 0.001, 0.001],
                 "translate": geo.translate
             },
-            "metadata": {},
+            "metadata": {
+                "referenceSystem": geo.reference_system
+            },
             "CityObjects": city_objects,
             "vertices": all_vertices
         }
