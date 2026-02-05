@@ -322,7 +322,7 @@ class Converter:
             return indices
 
         def add_object(cj_type, verts, bounds, attrs=None):
-            if not verts: return
+            if not verts: return None
 
             idx_map = add_verts(verts)
             new_bounds = []
@@ -331,23 +331,28 @@ class Converter:
                 for ring in surf:
                     new_surf.append([idx_map[idx] for idx in ring])
                 new_bounds.append(new_surf)
-            
+
+            obj_id = str(uuid4())
             obj = {
                 "type": cj_type,
                 "geometry": [{
                     "type": "MultiSurface",
-                    "lod": "2.2", 
+                    "lod": "2.2",
                     "boundaries": new_bounds
                 }]
             }
             if attrs: obj["attributes"] = attrs
-            city_objects[str(uuid4())] = obj
+            city_objects[obj_id] = obj
+            return obj_id
+
+        child_ids = []
 
         # 1. Process Elements
         logger.info("Processing standard elements...")
         for elem in reader.get_elements():
             v, b = proc.extract(elem)
-            add_object(self.map_type(elem), v, b, {"ifc_type": elem.is_a(), "name": getattr(elem, "Name", "")})
+            oid = add_object(self.map_type(elem), v, b, {"ifc_type": elem.is_a(), "name": getattr(elem, "Name", "")})
+            if oid: child_ids.append(oid)
 
         # 2. Process Spaces (Native)
         spaces = reader.get_spaces()
@@ -355,17 +360,30 @@ class Converter:
             logger.info(f"Processing {len(spaces)} native IFC spaces...")
             for space in spaces:
                 v, b = proc.extract(space)
-                add_object("Room", v, b, {"name": getattr(space, "Name", "Space")})
+                oid = add_object("Room", v, b, {"name": getattr(space, "Name", "Space")})
+                if oid: child_ids.append(oid)
         else:
             # --- MODIFICATION: VOXEL FALLBACK ---
             logger.info("No IfcSpace found. Attempting Voxel Detection...")
             detector = VoxelSpaceDetector(reader, voxel_size=0.5)
             detected_rooms = detector.detect()
             logger.info(f"Voxelization detected {len(detected_rooms)} rooms.")
-            
+
             for i, room in enumerate(detected_rooms):
-                add_object("Room", room["vertices"], room["boundaries"], {"name": f"Detected Room {i+1}"})
+                oid = add_object("Room", room["vertices"], room["boundaries"], {"name": f"Detected Room {i+1}"})
+                if oid: child_ids.append(oid)
             # ------------------------------------
+
+        # 3. Create parent Building and link children
+        building_id = str(uuid4())
+        city_objects[building_id] = {
+            "type": "Building",
+            "attributes": {},
+            "geometry": [],
+            "children": child_ids
+        }
+        for cid in child_ids:
+            city_objects[cid]["parents"] = [building_id]
 
         # Final JSON
         cj = {
