@@ -252,9 +252,15 @@ class GeometryProcessor:
         return v, b
 
 class Georeferencer:
+    # SLD99 / Sri Lanka Grid 1999 (EPSG:5235)
+    # Default origin: central Colombo area
+    DEFAULT_CRS = "https://www.opengis.net/def/crs/EPSG/0/5235"
+    DEFAULT_TRANSLATE = [399800.0, 492200.0, 10.0]  # Easting, Northing, Height in SLD99
+
     def __init__(self, reader):
         self.reader = reader
-        self.translate = [0.0, 0.0, 0.0]
+        self.translate = list(self.DEFAULT_TRANSLATE)
+        self.reference_system = self.DEFAULT_CRS
         self.found_crs = False
 
     def solve(self):
@@ -270,14 +276,19 @@ class Georeferencer:
                         self.found_crs = True
                         return
         if not self.found_crs:
+            # Offset building placement relative to SLD99 default origin
             buildings = self.reader.get_buildings()
             if buildings and buildings[0].ObjectPlacement:
                 try:
                     m = ifcopenshell.util.placement.get_local_placement(buildings[0].ObjectPlacement)
-                    self.translate = [float(m[0][3]), float(m[1][3]), float(m[2][3])]
-                    logger.info(f"Dynamic center calculated: {self.translate}")
+                    self.translate = [
+                        self.DEFAULT_TRANSLATE[0] + float(m[0][3]),
+                        self.DEFAULT_TRANSLATE[1] + float(m[1][3]),
+                        self.DEFAULT_TRANSLATE[2] + float(m[2][3]),
+                    ]
                 except Exception:
                     pass
+            logger.info(f"Using SLD99 (EPSG:5235) georeference: {self.translate}")
 
 class Converter:
     def __init__(self, ifc, out):
@@ -393,7 +404,9 @@ class Converter:
                 "scale": [0.001, 0.001, 0.001],
                 "translate": geo.translate
             },
-            "metadata": {},
+            "metadata": {
+                "referenceSystem": geo.reference_system
+            },
             "CityObjects": city_objects,
             "vertices": all_vertices
         }
