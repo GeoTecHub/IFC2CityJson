@@ -260,10 +260,45 @@ class Georeferencer:
     def __init__(self, reader):
         self.reader = reader
         self.translate = list(self.DEFAULT_TRANSLATE)
+        # model_origin is the point subtracted from model coords during vertex encoding.
+        # translate is the CityJSON transform translate (geographic coords).
+        # When these differ, the control-point transform maps model_origin -> translate.
+        self.model_origin = list(self.DEFAULT_TRANSLATE)
         self.reference_system = self.DEFAULT_CRS
         self.found_crs = False
 
+    @staticmethod
+    def normalize_crs(crs_str):
+        """Convert CRS shorthand (e.g. 'EPSG:4326') to OGC URI for CityJSON."""
+        if crs_str.startswith("http"):
+            return crs_str
+        parts = crs_str.upper().replace("::", ":").split(":")
+        if len(parts) == 2 and parts[0] == "EPSG":
+            return f"https://www.opengis.net/def/crs/EPSG/0/{parts[1]}"
+        return crs_str
+
+    def set_control_point(self, crs, model_point, geo_point):
+        """Set georeferencing via a user-supplied control point.
+
+        Args:
+            crs: Target CRS identifier (e.g. "EPSG:4326" or full OGC URI).
+            model_point: [x, y, z] of a known point in the IFC model coordinate space.
+            geo_point: [x, y, z] of that same point in the target CRS.
+
+        After this call, every model coordinate P is mapped to:
+            geographic = P - model_point + geo_point
+        """
+        self.reference_system = self.normalize_crs(crs)
+        self.model_origin = [float(v) for v in model_point]
+        self.translate = [float(v) for v in geo_point]
+        self.found_crs = True
+        logger.info(f"User control point: model {self.model_origin} -> geo {self.translate} in {self.reference_system}")
+
     def solve(self):
+        # If a user control point was already set, skip automatic detection
+        if self.found_crs:
+            return
+
         project = self.reader.get_project()
         if project:
             for ctx in project.RepresentationContexts or []:
@@ -273,6 +308,7 @@ class Georeferencer:
                 for op in coord_ops:
                     if op.is_a("IfcMapConversion"):
                         self.translate = [float(op.Eastings), float(op.Northings), float(op.OrthogonalHeight)]
+                        self.model_origin = list(self.translate)
                         self.found_crs = True
                         return
         if not self.found_crs:
@@ -288,12 +324,16 @@ class Georeferencer:
                     ]
                 except Exception:
                     pass
+            self.model_origin = list(self.translate)
             logger.info(f"Using SLD99 (EPSG:5235) georeference: {self.translate}")
 
 class Converter:
-    def __init__(self, ifc, out):
+    def __init__(self, ifc, out, crs=None, model_point=None, geo_point=None):
         self.ifc = ifc
         self.out = out
+        self.crs = crs
+        self.model_point = model_point
+        self.geo_point = geo_point
     
     IFC_TYPE_MAP = {
         "IfcSpace": "Room",
@@ -312,6 +352,8 @@ class Converter:
         if not reader.load(): return
         
         geo = Georeferencer(reader)
+        if self.crs and self.model_point and self.geo_point:
+            geo.set_control_point(self.crs, self.model_point, self.geo_point)
         geo.solve()
         proc = GeometryProcessor(reader)
         
@@ -322,9 +364,9 @@ class Converter:
         def add_verts(raw_verts):
             indices = []
             for v in raw_verts:
-                x = int(round((v[0] - geo.translate[0]) * 1000))
-                y = int(round((v[1] - geo.translate[1]) * 1000))
-                z = int(round((v[2] - geo.translate[2]) * 1000))
+                x = int(round((v[0] - geo.model_origin[0]) * 1000))
+                y = int(round((v[1] - geo.model_origin[1]) * 1000))
+                z = int(round((v[2] - geo.model_origin[2]) * 1000))
                 key = (x, y, z)
                 if key not in vertex_index:
                     vertex_index[key] = len(all_vertices)
@@ -422,9 +464,30 @@ class Converter:
         except Exception: pass
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("input")
-    parser.add_argument("output")
+    parser = argparse.ArgumentParser(
+        description="Convert IFC to CityJSON 2.0 with optional control-point georeferencing."
+    )
+    parser.add_argument("input", help="Input IFC file path")
+    parser.add_argument("output", help="Output CityJSON file path")
+    parser.add_argument("--crs", help="Target CRS (e.g. 'EPSG:4326' or full OGC URI)")
+    parser.add_argument(
+        "--model-point", nargs=3, type=float, metavar=("X", "Y", "Z"),
+        help="Known point in IFC model coordinates (x y z)"
+    )
+    parser.add_argument(
+        "--geo-point", nargs=3, type=float, metavar=("X", "Y", "Z"),
+        help="Geographic coordinates of the known point in target CRS (x y z)"
+    )
     args = parser.parse_args()
-    
-    Converter(args.input, args.output).run()
+
+    # Validate: all three control-point args must be given together, or none
+    cp_args = [args.crs, args.model_point, args.geo_point]
+    if any(cp_args) and not all(cp_args):
+        parser.error("--crs, --model-point, and --geo-point must all be provided together")
+
+    Converter(
+        args.input, args.output,
+        crs=args.crs,
+        model_point=args.model_point,
+        geo_point=args.geo_point,
+    ).run()
