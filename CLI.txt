@@ -1,0 +1,4 @@
+python3 ifc2cityjson_vox.py building.ifc output.json \
+    --crs "EPSG:32644" \
+    --model-point 0 0 0 \
+    --geo-point 500000.0 750000.0 15.0
